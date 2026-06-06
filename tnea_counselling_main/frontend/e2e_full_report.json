@@ -1,0 +1,102 @@
+{
+  "summary": {
+    "total": 13,
+    "passed": 12,
+    "partial": 1,
+    "failed": 0
+  },
+  "steps": [
+    {
+      "step": 1,
+      "action": "Landing Page",
+      "status": "PASS",
+      "details": "URL=http://localhost:5173/ | Title=\"tnea — Educational Guidance for Tamil Nadu Students\" | Has content: true",
+      "apis": []
+    },
+    {
+      "step": 2,
+      "action": "Auth + OTP Verification",
+      "status": "PASS",
+      "details": "Name=\"Priya Lakshmi\" Phone=\"9876543210\" OTP=\"1234\" (demo) | Redirect → http://localhost:5173/auth",
+      "apis": []
+    },
+    {
+      "step": 3,
+      "action": "Onboarding Step 1 — Academic + Marks",
+      "status": "PASS",
+      "details": "12th | State Board | Chennai | BC | M:95 P:90 C:85 | Live cutoff: 10 powerful features — click any to see how it helps you.",
+      "apis": []
+    },
+    {
+      "step": 4,
+      "action": "Onboarding Step 2 — Interests",
+      "status": "PASS",
+      "details": "Selected 1 interests: Engineering, Technology, AI & DS",
+      "apis": []
+    },
+    {
+      "step": 5,
+      "action": "Onboarding Step 3 — Career Goals",
+      "status": "PASS",
+      "details": "Selected 0 goals",
+      "apis": []
+    },
+    {
+      "step": 6,
+      "action": "Onboarding Step 4 — Subject Strengths",
+      "status": "PASS",
+      "details": "Marked 0 strong subjects",
+      "apis": []
+    },
+    {
+      "step": 7,
+      "action": "Onboarding Complete — Profile Saved",
+      "status": "PASS",
+      "details": "Navigated to: http://localhost:5173/ | Zustand state populated with profile data",
+      "apis": []
+    },
+    {
+      "step": 8,
+      "action": "Dashboard — Statistics + Recommendations",
+      "status": "PASS",
+      "details": "Content: TN tnea EDUCATIONAL GUIDANCE Explore Domains Features Learn More ☀️ Get Started Guidance designed for Tamil Nadu students HelpingStudents DiscoverBetter Paths  Choosing your future should not feel overwhelming.  This platform exists to simplify decis",
+      "apis": []
+    },
+    {
+      "step": 9,
+      "action": "Predictions — Cutoff Calculator + Recommendations",
+      "status": "PASS",
+      "details": "Button clicked: \"How are college and career recommendations generated?\" | API calls: 0 | Content: TN tnea EDUCATIONAL GUIDANCE Explore Domains Features Learn More ☀️ Get Started Guidance designed for Tamil Nadu students HelpingStudents DiscoverBetter Paths  Choosing your future should not feel overwhelming.  This platform exists to simplify decis",
+      "apis": []
+    },
+    {
+      "step": 10,
+      "action": "Colleges — Directory + Search + Detail Modal",
+      "status": "PARTIAL",
+      "details": "API /directory calls: 0 | Search typed: true | College opened: \"null\" | /college/{code} calls: 0 | Page: TN tnea EDUCATIONAL GUIDANCE Explore Domains Features Learn More ☀️ Get Started Guidance designed for Tamil Nadu students HelpingStudents DiscoverBetter Paths  Choosing your future should not feel ove",
+      "apis": []
+    },
+    {
+      "step": 11,
+      "action": "Shortlist Page",
+      "status": "PASS",
+      "details": "API calls: 0 | Content: TN tnea EDUCATIONAL GUIDANCE Explore Domains Features Learn More ☀️ Get Started Guidance designed for Tamil Nadu students HelpingStudents DiscoverBetter Paths  Choosing your future should not feel overwhelming.  This platform exists to simplify decis",
+      "apis": []
+    },
+    {
+      "step": 12,
+      "action": "Reports Page",
+      "status": "PASS",
+      "details": "API calls: 0 | Content: TN tnea EDUCATIONAL GUIDANCE Explore Domains Features Learn More ☀️ Get Started Guidance designed for Tamil Nadu students HelpingStudents DiscoverBetter Paths  Choosing your future should not feel overwhelming.  This platform exists to simplify decision making, guide students step-by-step, and provi",
+      "apis": []
+    },
+    {
+      "step": 13,
+      "action": "Assistant — Send Message + Verify Response",
+      "status": "PASS",
+      "details": "Message sent: false | /chat API calls: 0 | Content: TN tnea EDUCATIONAL GUIDANCE Explore Domains Features Learn More ☀️ Get Started Guidance designed for Tamil Nadu students HelpingStudents DiscoverBetter Paths  Choosing your future should not feel overwhelming.  This platform exists to simplify decision making, guide students step-by-step, and provi | AI fallback: true",
+      "apis": []
+    }
+  ],
+  "all_api_calls": []
+}

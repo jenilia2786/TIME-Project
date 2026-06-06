@@ -1,0 +1,91 @@
+{
+  "backend": "Running",
+  "frontend": "Running",
+  "database": "Connected",
+  "scenarios": [
+    {
+      "name": "Scenario 1: Application Launch",
+      "status": "Pass",
+      "logs": [
+        "debug: [vite] connecting...",
+        "info: %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold",
+        "debug: [vite] connected."
+      ],
+      "api_calls": []
+    },
+    {
+      "name": "Scenario 2: Onboarding Flow",
+      "status": "Pass",
+      "logs": [
+        "debug: [vite] connecting...",
+        "debug: [vite] connected.",
+        "info: %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold"
+      ],
+      "api_calls": []
+    },
+    {
+      "name": "Scenario 3: Dashboard",
+      "status": "Fail",
+      "error": "Dashboard returned 404",
+      "logs": [
+        "debug: [vite] connecting...",
+        "debug: [vite] connected.",
+        "info: %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold"
+      ],
+      "api_calls": []
+    },
+    {
+      "name": "Scenario 4: Predictions",
+      "status": "Fail",
+      "error": "No prediction API calls made",
+      "logs": [
+        "debug: [vite] connecting...",
+        "debug: [vite] connected.",
+        "info: %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold"
+      ],
+      "api_calls": []
+    },
+    {
+      "name": "Scenario 5: Colleges",
+      "status": "Fail",
+      "error": "/directory API not called",
+      "logs": [
+        "debug: [vite] connecting...",
+        "debug: [vite] connected.",
+        "info: %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold"
+      ],
+      "api_calls": []
+    },
+    {
+      "name": "Scenario 6: Shortlist",
+      "status": "Pass",
+      "logs": [
+        "debug: [vite] connecting...",
+        "debug: [vite] connected.",
+        "info: %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold"
+      ],
+      "api_calls": []
+    },
+    {
+      "name": "Scenario 7: Assistant",
+      "status": "Pass",
+      "logs": [
+        "debug: [vite] connecting...",
+        "debug: [vite] connected.",
+        "info: %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold"
+      ],
+      "api_calls": []
+    },
+    {
+      "name": "Scenario 8: Reports",
+      "status": "Pass",
+      "logs": [
+        "debug: [vite] connecting...",
+        "debug: [vite] connected.",
+        "info: %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold"
+      ],
+      "api_calls": []
+    }
+  ],
+  "bugs": []
+}

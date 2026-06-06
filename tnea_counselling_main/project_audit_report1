@@ -1,0 +1,208 @@
+# T.I.M.E Project — Full Audit Report
+*Code Analysis + Runtime Status Check | June 2026*
+
+---
+
+## 🔴 CRITICAL: Backend NOT Running
+
+> [!CAUTION]
+> **The FastAPI backend (port 8000) is NOT running.** The frontend (port 5173) is running, but ALL features that depend on the backend are completely broken for users right now.
+
+Confirmed via `Invoke-WebRequest` → `Unable to connect to the remote server` on `http://127.0.0.1:8000`
+
+**What this means:**
+- Cutoff Predictor → ❌ Fails (calls `/calculate-cutoff`)
+- College Recommendations → ❌ Fails (calls `/recommend`)
+- AI Assistant chat → ❌ Fails (calls `/chat`)
+- College Directory → ❌ Fails (calls `/directory`)
+- Shortlist → ❌ Fails (calls `/choice/*`)
+- College search → ❌ Fails (calls `/college/search`)
+
+**To start the backend:**
+```bash
+cd "n:\Projects\TNEA Projects\Tnea_Counseling-main\backend"
+.venv\Scripts\uvicorn app.main:app --reload --port 8000
+```
+
+---
+
+## Summary Table
+
+| Category | Status |
+|---|---|
+| Frontend (React/Vite) | ✅ Running on port 5173 |
+| Backend (FastAPI) | ❌ NOT running |
+| SQLite Database | ✅ Exists (6.1 MB) |
+| ChromaDB (RAG) | ✅ Files exist |
+| Frontend ↔ Backend Connection | ❌ Broken (backend offline) |
+| AI (Groq + RAG) | ⚠️ Configured but not testable (backend down) |
+| Authentication | ⚠️ Frontend-only simulation (no real backend auth) |
+| Data persistence | ⚠️ localStorage only (no DB for user data) |
+
+---
+
+## ✅ What Is Completed & Working (Code Level)
+
+### Frontend Pages (All built, all routed)
+| Page | Implemented | Real Data | Notes |
+|---|---|---|---|
+| Landing (`/`) | ✅ | N/A | Static content |
+| Auth (`/auth`) | ✅ | ⚠️ Simulated | OTP is fake (demo mode) |
+| Onboarding (`/onboarding`) | ✅ | N/A | Stores to localStorage |
+| Dashboard (`/dashboard`) | ✅ | ⚠️ Mixed | Cards are real, recommendations need backend |
+| Colleges (`/colleges`) | ✅ | ❌ Backend needed | Full directory UI built |
+| Exams (`/exams`) | ✅ | ✅ Hardcoded | 100% static data |
+| Scholarships (`/scholarships`) | ✅ | ✅ Hardcoded | 100% static data - real Tamil Nadu scholarships |
+| Roadmap (`/roadmap`) | ✅ | ✅ Hardcoded | 6 career paths built statically |
+| Careers (`/careers`) | ✅ | ✅ Hardcoded | Career data built statically |
+| Predictions (`/predictions`) | ✅ | ❌ Backend needed | UI built, cutoff calc needs backend |
+| Assistant (`/assistant`) | ✅ | ❌ Backend needed | Chat UI built, AI needs backend |
+| Shortlist (`/shortlist`) | ✅ | ❌ Backend needed | Calls `/choice/*` endpoints |
+| Reports (`/reports`) | ✅ | ⚠️ Mock only | "Generate" works but output is fake |
+| Settings (`/settings`) | ✅ | ⚠️ localStorage | No backend save |
+| Courses (`/courses`) | ✅ | ✅ Hardcoded | Static course data |
+| Profile (`/profile`) | ✅ | ⚠️ localStorage | No backend sync |
+
+### Backend Endpoints (code complete, offline)
+| Endpoint | Implemented | Notes |
+|---|---|---|
+| `POST /recommend` | ✅ | Full SQL query with tiering logic |
+| `POST /chat` | ✅ | Groq + Ollama fallback + RAG |
+| `POST /calculate-cutoff` | ✅ | TNEA formula implemented |
+| `GET /directory` | ✅ | Paginated, cached, multi-filter |
+| `GET /college/{code}` | ✅ | Full college profile |
+| `GET /metadata` | ✅ | Districts + branches |
+| `GET /tfc` | ✅ | TFC centers |
+| `POST /choice/*` | ✅ | Shortlist CRUD |
+| `GET /health` | ✅ | Health check endpoint |
+| `GET /rag_records` | ✅ | View RAG documents |
+
+### Database
+- SQLite DB: `tnea_structured.db` (6.1 MB) — exists ✅
+- ChromaDB vector store: exists in `data/db/chroma_db/` ✅
+- RAG Documents: 8 files including `tnea_cutoff_all.json` (49MB!) ✅
+- Tables: `colleges`, `college_cutoffs`, `courses`, `hostel_details`, `transport_details`, `tfc_centers`, `contacts` ✅
+
+---
+
+## ❌ What Is NOT Implemented (per Project Requirements)
+
+### 1. Real Authentication System
+> [!WARNING]
+> **OTP is completely fake.** The code says literally: `"Demo mode: Enter any 4 digits to continue"`. No real SMS/OTP service is integrated. Anyone can sign up with any number.
+
+- No backend user table / user accounts
+- No real mobile OTP (no Twilio, MSG91, etc.)
+- DOB is collected for login but validated only by comparing to localStorage — trivially bypassable
+- **User sessions exist only in browser localStorage** — clearing browser data logs them out permanently
+
+### 2. Stage-Differentiated Recommendations
+> [!IMPORTANT]
+> The project spec says **10th, 12th, and UG students should get completely different recommendations**. Currently:
+> - All students go to the same Dashboard regardless of standard
+> - The `/recommend` endpoint only filters by cutoff, category, branch, district — it does NOT differentiate by standard (10th vs 12th vs UG)
+> - There is NO 10th-standard-specific content (Diploma, ITI, Group Selection guidance)
+> - There is NO UG-specific content (PG recommendations, Research, Certification)
+
+### 3. Parent Account — Multiple Child Profiles
+> [!IMPORTANT]
+> The spec says parents manage multiple child profiles, each isolated. Partially implemented:
+> - ✅ UI allows creating multiple profiles (in Settings + Dashboard)
+> - ✅ localStorage stores multiple profiles
+> - ❌ Each profile's data is NOT isolated from the others at the recommendation level
+> - ❌ Switching profiles does NOT send a different session_id to the backend
+> - ❌ No backend awareness of parent vs child — all sessions are treated identically
+
+### 4. AI Dashboard Update Prompt
+> [!IMPORTANT]
+> The spec says: *"When conversation indicates a change in interest, AI asks: 'Would you like to personalize your dashboard based on your recent conversations?' If Yes → dashboard updates."*
+> - **This is completely missing.** The AI chat (`/assistant`) is totally disconnected from the dashboard.
+> - Changing interest via chat → NOTHING happens to dashboard recommendations.
+
+### 5. Reports Module
+- The "Generate AI Report" button simulates a 2.5-second delay and shows "Report Generated Successfully!" but there is **no real report generated** — no PDF, no actual content is produced.
+- The "Download Full PDF" button has no actual PDF download handler.
+
+### 6. Careers, Exams, Scholarships — No Backend Personalization
+- All three pages are 100% static hardcoded data.
+- They do NOT read from the student's profile (community, standard, district) to filter relevant results.
+- e.g., An SC student will see the exact same scholarship list as an OC student (no filtering by community).
+- A 10th standard student sees the same exams as a 12th standard student.
+
+### 7. Courses Page
+- 100% static hardcoded data. Not connected to the backend `/college/*` courses at all.
+- The "1,200+ courses" counter is fake — hardcoded string.
+
+---
+
+## ⚠️ Errors & Issues in the Flow
+
+### Authentication Flow Issues
+1. **OTP is not real** — users can enter "1234" and get in
+2. **Login "verification"** — DOB is checked against `localStorage` only. If a user clears their browser, they lose their account permanently and cannot recover it.
+3. **"12,000+ Tamil Nadu students already on their journey"** on the auth page is a fake/placeholder social proof number.
+4. **No email or real account recovery** — The "Recovery ID" in Profile is a locally-generated ID like `TNEDU-2026-123456`, but there is no backend endpoint to actually restore a session from this ID.
+
+### Onboarding Issues
+5. The Onboarding collects marks (Maths, Physics, Chemistry) and computes a `computedCutoff` value — **this calculation happens locally in the frontend** using the formula `maths + (physics/2) + (chemistry/2)`. This works fine.
+6. But the `computedCutoff` is stored only in Zustand → localStorage, not sent to the backend during onboarding.
+
+### Dashboard Issues
+7. Dashboard shows a "Live College Matches" section that calls the `/recommend` backend. When backend is offline, **this silently fails or shows an empty state** with no error message to the user.
+8. Profile completion metric works correctly (local).
+
+### Predictions Page Issues
+9. The `calculateCutoff` service calls `POST /calculate-cutoff` which requires `preferred_branch` and `district` in the request body. The Predictions page UI does NOT have a "preferred_branch" input — it only has Physics, Chemistry, Maths, Community, District. The field is passed as `'all'` by default. This is fine functionally but limits accuracy.
+
+### AI Assistant Issues
+10. If the backend is offline, AI shows: "AI Assistant is currently running in offline mode because AI dependencies are unavailable." — **But this message is misleading** — it's not that AI dependencies are unavailable; it's that the backend server itself is not running.
+11. The AI in `main.py` has a fallback: Groq → Ollama. **If `GROQ_API_KEY` is missing from the `.env` file**, it falls to Ollama. If Ollama is also not running locally, it returns an error. Need to verify `.env` file exists.
+
+### Content Relevance Issues
+12. **Landing page** — Content is relevant to the project (TNEA counseling, Tamil Nadu students). However it uses generic phrases like "Your AI-Powered Academic Guide." The specific mention of TNEA, Engineering, Tamil Nadu is present.
+13. **Scholarships** — Data IS real Tamil Nadu government scholarships (SC, ST, BC, MBC etc.) ✅
+14. **Roadmap** — Shows Engineering, Medical, Arts & Science, Commerce, Law, Design paths. Only Engineering has backend RAG support. Others are purely static. ✅ for content relevance.
+15. **Exams** — Contains actual TNEA-relevant exams (JEE, NEET, TNEA, BITSAT, VITEEE etc.) ✅
+
+### Backend Configuration Issues
+16. **`CHROMA_PATH` is relative**: `"backend/data/db/chroma_db"` — this means ChromaDB only works if uvicorn is run FROM the project root (`Tnea_Counseling-main/`), NOT from inside the `backend/` folder. This is a common startup failure cause.
+17. **`local_files_only: True`** in HuggingFace embeddings — the model must be pre-downloaded. If it's not cached, AI initialization will fail silently (graceful degradation mode).
+18. **No `.env` file check** — There's no startup validation that `GROQ_API_KEY` is set.
+
+---
+
+## 🟡 Partial / In-Progress Features
+
+| Feature | Status | What's Missing |
+|---|---|---|
+| Multi-profile switching | ⚠️ Partial | Not isolated at backend level |
+| Theme (dark/light) | ✅ Complete | Works fully |
+| Sidebar collapse | ✅ Complete | Works fully |
+| Language toggle (Tamil/English) | ⚠️ Partial | i18n set up but translations may be incomplete |
+| Persistent Chat bubble | ✅ Navigates to /assistant | No inline chat |
+| Tutorial overlay | ✅ Built | Fires on first login |
+| Cutoff gauge animation | ✅ Built | Visual only, works when backend calculates cutoff |
+| College bookmarking (Shortlist) | ✅ UI + backend | Needs backend running |
+| College detail page | ❌ Missing | No `/colleges/:id` route in frontend |
+
+---
+
+## 🔧 Recommended Fixes Priority
+
+### Immediate (Critical)
+1. **Start the backend** → `uvicorn app.main:app --reload --port 8000` from project root
+2. **Verify `.env` file** → Check `GROQ_API_KEY` is set in `backend/app/.env` or `backend/.env`
+3. **Fix CHROMA_PATH** → Use `os.path.join(os.path.dirname(__file__), "..", "data", "db", "chroma_db")` instead of the relative string
+
+### Short-term (Important)
+4. **Real OTP** → Integrate MSG91 or Twilio for real SMS OTP
+5. **Backend User Table** → Store user accounts in DB so login actually works
+6. **Community-based scholarship filtering** → Read student's community from store and filter `SCHOLARSHIPS` array
+7. **Standard-based content** → Show different Dashboard cards for 10th/12th/UG students
+8. **Reports PDF** → Integrate jsPDF or a server-side PDF generator
+
+### Long-term (Features)
+9. **AI → Dashboard integration** → After chat, if new interests detected, prompt dashboard update
+10. **UG content** → PG recommendations, research paths
+11. **10th standard content** → Diploma, ITI, Group guidance
+12. **Parent profile isolation** → Pass child profile ID to backend as session key

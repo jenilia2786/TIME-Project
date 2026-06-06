@@ -1,0 +1,1952 @@
+from fastapi import FastAPI, Depends, HTTPException, Request, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List, Optional, Dict
+import time
+import random
+import json
+import hashlib
+from datetime import datetime, timedelta
+from sqlalchemy import or_, and_, desc, func, asc, distinct
+from sqlalchemy.orm import Session
+from .database import (
+    SessionLocal, College, TFCCenter, Contact, Course, HostelDetails,
+    TransportDetails, CollegeCutoff, User, OTPStore, UserProfile,
+    ChatHistory, SavedCollege, SavedScholarship, CollegeChoice
+)
+import os
+from dotenv import load_dotenv
+
+# Load env from multiple possible locations
+load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+# --- AI Graceful Degradation Mode ---
+AI_AVAILABLE = False
+AI_ERROR = None
+vector_db = None
+embeddings = None
+device = "cpu"
+
+# Fix: Use absolute path for ChromaDB so it works regardless of where uvicorn is launched
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_DIR = os.path.dirname(APP_DIR)
+CHROMA_PATH = os.path.join(BACKEND_DIR, "data", "db", "chroma_db")
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+try:
+    import ollama
+    import torch
+    from langchain_chroma import Chroma
+    from langchain_huggingface import HuggingFaceEmbeddings
+    
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL, 
+        model_kwargs={'device': device, 'local_files_only': True}
+    )
+    vector_db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings, collection_name="tnea_docs")
+    print(f"--- ChromaDB loaded from: {CHROMA_PATH} ---")
+    print(f"--- Embeddings initialized on device: {device} ---")
+    
+    AI_AVAILABLE = True
+except ImportError as e:
+    AI_ERROR = f"ImportError: {str(e)}"
+    print(f"--- AI Graceful Degradation Mode Enabled: {AI_ERROR} ---")
+except Exception as e:
+    AI_ERROR = str(e)
+    print(f"--- AI Initialization Failed: {AI_ERROR} ---")
+
+app = FastAPI(title="TNEA Pro Counselling AI")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- In-Memory Cache & Memory ---
+USER_SESSIONS: Dict[str, dict] = {} # {session_id: {cutoff, category, choices: []}}
+USER_CHOICES: Dict[str, List[dict]] = {} # {session_id: [choice_data]}
+
+# --- Directory response cache (TTL = 300 seconds) ---
+# Key: (search, tuple(sorted districts), tuple(sorted branches))
+# Value: {"ts": float, "result": List[dict]}
+_DIRECTORY_CACHE: Dict[tuple, dict] = {}
+_DIRECTORY_CACHE_TTL = 300  # seconds
+
+def _get_directory_cache(key: tuple):
+    entry = _DIRECTORY_CACHE.get(key)
+    if entry and (time.time() - entry["ts"]) < _DIRECTORY_CACHE_TTL:
+        return entry["result"]
+    return None
+
+def _set_directory_cache(key: tuple, result: list):
+    _DIRECTORY_CACHE[key] = {"ts": time.time(), "result": result}
+    # Keep cache small — evict if too many keys
+    if len(_DIRECTORY_CACHE) > 200:
+        oldest = min(_DIRECTORY_CACHE, key=lambda k: _DIRECTORY_CACHE[k]["ts"])
+        del _DIRECTORY_CACHE[oldest]
+
+# GPU and Embeddings logic moved to Graceful Degradation block above
+
+def clean_district_name(d: str) -> str:
+    if not d:
+        return "Tamil Nadu"
+    d_upper = d.strip().upper()
+    DISTRICT_MAPPING = {
+        "CHENGALPET": "CHENGALPATTU",
+        "KANCHIPURAM": "KANCHIPURAM",
+        "KANCHIPURAM": "KANCHIPURAM",
+        "COIMBATORE": "COIMBATORE",
+        "NAMAKKAL": "NAMAKKAL"
+    }
+    return DISTRICT_MAPPING.get(d_upper, d_upper).title()
+
+def clean_branch_name(name: str) -> str:
+    if not name:
+        return "General"
+    
+    # Strip and convert multiple spaces to a single space
+    b = " ".join(name.strip().split())
+    b_upper = b.upper()
+    
+    # Common spelling, naming, and acronym normalization
+    if b_upper in ["AGRICULTURE ENGINEERING", "AGRICULTURAL ENGINEERING"]:
+        return "Agricultural Engineering"
+    
+    if b_upper in ["COMPUTER SCIENCE AND BUSSINESS SYSTEM", "COMPUTER SCIENCE AND BUSINESS SYSTEM"]:
+        return "Computer Science and Business System"
+    if b_upper == "COMPUTER SCIENCE AND BUSINESS SYSTEM (SS)":
+        return "Computer Science and Business System (SS)"
+        
+    BRANCH_MAP = {
+        "AERONAUTICAL ENGINEERING": "Aeronautical Engineering",
+        "AEROSPACE ENGINEERING": "Aerospace Engineering",
+        "AUTOMOBILE ENGINEERING": "Automobile Engineering",
+        "AUTOMOBILE ENGINEERING (SS)": "Automobile Engineering (SS)",
+        "BIO MEDICAL ENGINEERING": "Bio Medical Engineering",
+        "BIO MEDICAL ENGINEERING (SS)": "Bio Medical Engineering (SS)",
+        "BIO MEDICAL ENGINEERING  (SS)": "Bio Medical Engineering (SS)",
+        "BIO TECHNOLOGY": "Bio Technology",
+        "BIO TECHNOLOGY (SS)": "Bio Technology (SS)",
+        "CHEMICAL ENGINEERING": "Chemical Engineering",
+        "CHEMICAL ENGINEERING (SS)": "Chemical Engineering (SS)",
+        "CHEMICAL  ENGINEERING": "Chemical Engineering",
+        "CHEMICAL  ENGINEERING (SS)": "Chemical Engineering (SS)",
+        "CIVIL ENGINEERING": "Civil Engineering",
+        "CIVIL ENGINEERING (SS)": "Civil Engineering (SS)",
+        "CIVIL  ENGINEERING": "Civil Engineering",
+        "CIVIL  ENGINEERING (SS)": "Civil Engineering (SS)",
+        "COMPUTER SCIENCE AND ENGINEERING": "Computer Science and Engineering",
+        "COMPUTER SCIENCE AND ENGINEERING (SS)": "Computer Science and Engineering (SS)",
+        "COMPUTER SCIENCE AND ENGINEERING (AI AND MACHINE LEARNING)": "Computer Science and Engineering (AI and Machine Learning)",
+        "COMPUTER SCIENCE AND ENGINEERING (ARTIFICIAL INTELLIGENCE AND MACHINE LEARNING)": "Computer Science and Engineering (AI and Machine Learning)",
+        "COMPUTER SCIENCE AND ENGINEERING(ARTIFICIAL INTELLIGENCE)": "Computer Science and Engineering (Artificial Intelligence)",
+        "ELECTRICAL AND ELECTRONICS ENGINEERING": "Electrical and Electronics Engineering",
+        "ELECTRICAL AND ELECTRONICS ENGINEERING (SS)": "Electrical and Electronics Engineering (SS)",
+        "ELECTRONICS AND COMMUNICATION ENGINEERING": "Electronics and Communication Engineering",
+        "ELECTRONICS AND COMMUNICATION ENGINEERING (SS)": "Electronics and Communication Engineering (SS)",
+        "ELECTRONICS AND INSTRUMENTATION ENGINEERING": "Electronics and Instrumentation Engineering",
+        "FASHION TECHNOLOGY": "Fashion Technology",
+        "FASHION TECHNOLOGY (SS)": "Fashion Technology (SS)",
+        "FOOD TECHNOLOGY": "Food Technology",
+        "FOOD TECHNOLOGY (SS)": "Food Technology (SS)",
+        "INDUSTRIAL BIO TECHNOLOGY": "Industrial Bio Technology",
+        "INDUSTRIAL BIO TECHNOLOGY (SS)": "Industrial Bio Technology (SS)",
+        "INDUSTRIAL ENGINEERING": "Industrial Engineering",
+        "INFORMATION TECHNOLOGY": "Information Technology",
+        "INFORMATION TECHNOLOGY (SS)": "Information Technology (SS)",
+        "INSTRUMENTATION AND CONTROL ENGINEERING": "Instrumentation and Control Engineering",
+        "INSTRUMENTATION AND CONTROL ENGINEERING (SS)": "Instrumentation and Control Engineering (SS)",
+        "MANUFACTURING ENGINEERING": "Manufacturing Engineering",
+        "MARINE ENGINEERING": "Marine Engineering",
+        "MECHANICAL ENGINEERING": "Mechanical Engineering",
+        "MECHANICAL ENGINEERING (SS)": "Mechanical Engineering (SS)",
+        "MECHATRONICS": "Mechatronics",
+        "METALLURGICAL ENGINEERING": "Metallurgical Engineering",
+        "METALLURGICAL ENGINEERING (SS)": "Metallurgical Engineering (SS)",
+        "PETRO CHEMICAL ENGINEERING": "Petro Chemical Engineering",
+        "PHARMACEUTICAL TECHNOLOGY": "Pharmaceutical Technology",
+        "PHARMACEUTICAL TECHNOLOGY (SS)": "Pharmaceutical Technology (SS)",
+        "PRODUCTION ENGINEERING": "Production Engineering",
+        "PRODUCTION ENGINEERING (SS)": "Production Engineering (SS)",
+        "ROBOTICS AND AUTOMATION": "Robotics and Automation",
+        "ROBOTICS AND AUTOMATION (SS)": "Robotics and Automation (SS)",
+        "TEXTILE TECHNOLOGY": "Textile Technology",
+        "TEXTILE TECHNOLOGY (SS)": "Textile Technology (SS)"
+    }
+    
+    if b_upper in BRANCH_MAP:
+        return BRANCH_MAP[b_upper]
+    return b.title()
+
+def get_college_districts_map(db: Session) -> Dict[int, str]:
+    rows = db.query(College.college_code, College.district).filter(College.college_code.isnot(None)).all()
+    mapping = {}
+    for code_str, dist in rows:
+        if not code_str:
+            continue
+        try:
+            code = int(str(code_str).strip())
+            d_clean = clean_district_name(dist)
+            mapping[code] = d_clean
+        except ValueError:
+            continue
+    return mapping
+
+# --- Dynamic Branch Discovery ---
+# We load all unique branches from the DB to ensure we can match ANY branch
+ALL_BRANCHES = []
+def load_branches():
+    global ALL_BRANCHES
+    try:
+        db = SessionLocal()
+        branches = db.query(CollegeCutoff.branch_name).distinct().all()
+        # Store clean normalized names
+        ALL_BRANCHES = sorted(list(set(clean_branch_name(b[0]).upper() for b in branches if b[0])))
+        print(f"--- Loaded {len(ALL_BRANCHES)} unique branches from database ---")
+        db.close()
+    except Exception as e:
+        print(f"Error loading branches: {e}")
+
+load_branches()
+
+def get_branch_filter_condition(branch_clean: str):
+    from sqlalchemy import or_, func
+    b_norm = branch_clean.strip().upper()
+    
+    if b_norm in ["IT", "INFORMATION TECHNOLOGY"]:
+        return CollegeCutoff.branch_name.ilike("%Information Technology%")
+    elif b_norm in ["CSE", "CS", "COMPUTER SCIENCE", "COMPUTER SCIENCE AND ENGINEERING"]:
+        return or_(
+            CollegeCutoff.branch_name.ilike("%Computer Science%"),
+            CollegeCutoff.branch_name.ilike("%Computer Science and Engineering%"),
+            CollegeCutoff.branch_name.ilike("%Computer Science & Engineering%")
+        )
+    elif b_norm in ["AIDS", "AD", "AI&DS", "AI-DS", "AI AND DS", "ARTIFICIAL INTELLIGENCE AND DATA SCIENCE"]:
+        return or_(
+            CollegeCutoff.branch_name.ilike("%Artificial Intelligence and Data Science%"),
+            CollegeCutoff.branch_name.ilike("%Artificial Intelligence & Data Science%"),
+            CollegeCutoff.branch_name.ilike("%AI%DS%"),
+            CollegeCutoff.branch_name.ilike("%Artificial Intelligence and Data Science (SS)%")
+        )
+    elif b_norm in ["AIML", "AI&ML", "AI-ML", "AI AND ML", "ARTIFICIAL INTELLIGENCE AND MACHINE LEARNING"]:
+        return or_(
+            CollegeCutoff.branch_name.ilike("%Artificial Intelligence and Machine Learning%"),
+            CollegeCutoff.branch_name.ilike("%Artificial Intelligence & Machine Learning%"),
+            CollegeCutoff.branch_name.ilike("%AI%ML%")
+        )
+    elif b_norm in ["BM", "BME", "BIOMEDICAL", "BIOMEDICAL ENGINEERING", "BIO MEDICAL ENGINEERING"]:
+        return or_(
+            CollegeCutoff.branch_name.ilike("%Bio Medical Engineering%"),
+            CollegeCutoff.branch_name.ilike("%Biomedical Engineering%")
+        )
+    elif b_norm in ["AGRICULTURAL ENGINEERING", "AGRICULTURE ENGINEERING"]:
+        return or_(
+            CollegeCutoff.branch_name.ilike("%Agricultural%Engineering%"),
+            CollegeCutoff.branch_name.ilike("%Agriculture%Engineering%")
+        )
+    elif b_norm in ["COMPUTER SCIENCE AND BUSINESS SYSTEM", "COMPUTER SCIENCE AND BUSSINESS SYSTEM"]:
+        return or_(
+            CollegeCutoff.branch_name.ilike("%Business%"),
+            CollegeCutoff.branch_name.ilike("%Bussiness%")
+        )
+    else:
+        # Replace spaces with wildcards to ignore double-space and spelling variations in database
+        tokens = b_norm.split()
+        wildcard_pattern = "%" + "%".join(tokens) + "%"
+        return func.replace(CollegeCutoff.branch_name, ".", "").ilike(wildcard_pattern)
+
+# --- Models ---
+class QueryRequest(BaseModel):
+    query: Optional[str] = None
+    session_id: Optional[str] = "default"
+    category: Optional[str] = "OC"
+    cutoff: Optional[float] = 0.0
+    district: Optional[str] = None
+    branch: Optional[str] = None
+    districts: Optional[List[str]] = None
+    branches: Optional[List[str]] = None
+    institution_type: Optional[str] = None
+
+class RecommendationResponse(BaseModel):
+    college_code: int
+    college_name: str
+    branch_name: str
+    district: str
+    cutoff: str
+    history: Optional[dict] = {}
+    reason: str
+    tier: str # Safe, Moderate, Dream
+    label: Optional[str] = ""
+    proximity: Optional[float] = 0.0
+
+# --- Core Logic ---
+
+# --- Core Logic ---
+
+def get_db():
+    db = SessionLocal()
+    try: yield db
+    finally: db.close()
+
+@app.post("/recommend", response_model=List[RecommendationResponse])
+async def recommend_endpoint(request: QueryRequest, db: Session = Depends(get_db)):
+    from sqlalchemy import cast, Integer, or_
+    cutoff = request.cutoff if request.cutoff is not None else 0.0
+    # Save to session memory
+    USER_SESSIONS[request.session_id] = {"cutoff": cutoff, "category": request.category}
+
+    # Load college code to district mapping
+    districts_map = get_college_districts_map(db)
+
+    # 1. Primary Search - Prioritize 2025 data, fallback to 2024
+    query = db.query(CollegeCutoff).filter((CollegeCutoff.cutoff_2025 > 0) | (CollegeCutoff.cutoff_2024 > 0)).filter(CollegeCutoff.branch_name.isnot(None))
+    
+    # Normalize input
+    dist_clean = request.district.strip().replace(".", "") if request.district else ""
+    branch_clean = request.branch.strip().upper().replace(".", "") if request.branch else ""
+    
+    # Apply filters if provided
+    if request.category:
+        query = query.filter(CollegeCutoff.category == request.category)
+    
+    # Multi-district selection support (joined against Colleges table to get clean districts)
+    if request.districts or dist_clean:
+        query = query.outerjoin(College, cast(College.college_code, Integer) == CollegeCutoff.college_code)
+        
+        if request.districts:
+            from sqlalchemy import or_
+            dist_conditions = []
+            for d in request.districts:
+                d_clean = d.strip().replace(".", "").upper()
+                if d_clean:
+                    if d_clean in ["CHENGALPATTU", "CHENGALPET"]:
+                        dist_conditions.append(or_(
+                            College.district.ilike("%Chengalpattu%"),
+                            College.district.ilike("%Chengalpet%"),
+                            CollegeCutoff.district.ilike("%Chengalpattu%"),
+                            CollegeCutoff.district.ilike("%Chengalpet%")
+                        ))
+                    elif d_clean in ["KANCHIPURAM", "KANJEERAPURAM"]:
+                        dist_conditions.append(or_(
+                            College.district.ilike("%Kanchipuram%"),
+                            College.district.ilike("%Kancheepuram%"),
+                            CollegeCutoff.district.ilike("%Kanchipuram%"),
+                            CollegeCutoff.district.ilike("%Kancheepuram%")
+                        ))
+                    else:
+                        dist_conditions.append(or_(
+                            College.district.ilike(f"%{d}%"),
+                            CollegeCutoff.district.ilike(f"%{d}%")
+                        ))
+            if dist_conditions:
+                query = query.filter(or_(*dist_conditions))
+        elif dist_clean:
+            d_clean_upper = dist_clean.upper()
+            if d_clean_upper in ["CHENGALPATTU", "CHENGALPET"]:
+                query = query.filter(or_(
+                    College.district.ilike("%Chengalpattu%"),
+                    College.district.ilike("%Chengalpet%"),
+                    CollegeCutoff.district.ilike("%Chengalpattu%"),
+                    CollegeCutoff.district.ilike("%Chengalpet%")
+                ))
+            elif d_clean_upper in ["KANCHIPURAM", "KANJEERAPURAM"]:
+                query = query.filter(or_(
+                    College.district.ilike("%Kanchipuram%"),
+                    College.district.ilike("%Kancheepuram%"),
+                    CollegeCutoff.district.ilike("%Kanchipuram%"),
+                    CollegeCutoff.district.ilike("%Kancheepuram%")
+                ))
+            else:
+                query = query.filter(or_(
+                    College.district.ilike(f"%{dist_clean}%"),
+                    CollegeCutoff.district.ilike(f"%{dist_clean}%")
+                ))
+    
+    # Multi-branch selection support
+    if request.branches:
+        branch_conditions = []
+        for b in request.branches:
+            b_clean = b.strip().upper().replace(".", "")
+            if b_clean:
+                branch_conditions.append(get_branch_filter_condition(b_clean))
+        if branch_conditions:
+            query = query.filter(or_(*branch_conditions))
+    elif branch_clean:
+        query = query.filter(get_branch_filter_condition(branch_clean))
+    
+    results = query.all()
+    print(f"DEBUG: Found {len(results)} total matching records for processing.")
+
+    # 2. Relaxed Fallback (If no results in district, search statewide)
+    if not results and (request.district or request.districts):
+        print(f"DEBUG: Falling back to statewide search.")
+        query = db.query(CollegeCutoff).filter(CollegeCutoff.cutoff_2023 > 0)
+        if request.category: query = query.filter(CollegeCutoff.category == request.category)
+        
+        # Apply branch filters for fallback
+        if request.branches:
+            from sqlalchemy import or_
+            branch_conditions = []
+            for b in request.branches:
+                b_clean = b.strip().upper().replace(".", "")
+                if b_clean:
+                    branch_conditions.append(get_branch_filter_condition(b_clean))
+            if branch_conditions:
+                query = query.filter(or_(*branch_conditions))
+        elif branch_clean:
+            query = query.filter(get_branch_filter_condition(branch_clean))
+            
+        results = query.limit(500).all() # Get a large pool for fallback
+
+    # Group by College + Clean Branch to avoid duplicates and show ranges
+    grouped = {}
+    for col in results:
+        b_clean = clean_branch_name(col.branch_name)
+        key = (col.college_name, b_clean)
+        if key not in grouped:
+            grouped[key] = {
+                "col": col,
+                "branch_name": b_clean,
+                "history": {
+                    "2021": [],
+                    "2022": [],
+                    "2023": [],
+                    "2024": [],
+                    "2025": []
+                },
+                "cutoffs": []
+            }
+        
+        # Collect cutoffs for clean merge
+        for yr in ["2021", "2022", "2023", "2024", "2025"]:
+            val = getattr(col, f"cutoff_{yr}")
+            if val is not None and val > 0:
+                grouped[key]["history"][yr].append(val)
+        
+        # Track latest available cutoff
+        latest_c = col.cutoff_2025 or col.cutoff_2024 or col.cutoff_2023
+        if latest_c:
+            grouped[key]["cutoffs"].append(latest_c)
+
+    # Flatten history by taking maximum values
+    for key, data in grouped.items():
+        for yr in ["2021", "2022", "2023", "2024", "2025"]:
+            vals = data["history"][yr]
+            data["history"][yr] = max(vals) if vals else None
+
+    recommendations = []
+    for (c_name, b_name), data in grouped.items():
+        col = data["col"]
+        cutoffs = data["cutoffs"]
+        if not cutoffs:
+            continue
+        min_c = min(cutoffs)
+        max_c = max(cutoffs)
+        
+        # Use max_c for proximity/tiering logic as it's the most competitive
+        diff = cutoff - max_c
+        
+        # Friendly Suggester Logic (Balanced thresholds)
+        if diff >= 1:
+            tier = "Safe"
+            label = "High Probability"
+            reason = f"Excellent match! Your score of {cutoff} is above the {max_c} cutoff. Very high chance of admission."
+        elif -2 <= diff < 1:
+            tier = "Moderate"
+            label = "Good Match"
+            reason = f"Perfect match! This range ({min_c}-{max_c}) fits your score perfectly. Highly recommended."
+        elif -10 <= diff < -2:
+            tier = "Dream"
+            label = "Aspirational Reach"
+            reason = f"Great target! This is slightly ambitious but definitely worth a shot in early rounds."
+        else: continue
+            
+        # Format the cutoff display (Single value if same, or Range if different)
+        cutoff_display = f"{min_c} - {max_c}" if min_c != max_c else f"{min_c}"
+        
+        # Get clean district name
+        c_code_int = int(col.college_code) if col.college_code else 0
+        clean_dist = districts_map.get(c_code_int, clean_district_name(col.district))
+            
+        recommendations.append({
+            "college_code": c_code_int,
+            "college_name": c_name,
+            "branch_name": b_name,
+            "district": clean_dist,
+            "cutoff": cutoff_display,
+            "history": data.get("history", {}),
+            "raw_cutoff": max_c,
+            "reason": reason,
+            "tier": tier,
+            "label": label,
+            "proximity": abs(diff)
+        })
+    
+    # SMART SORTING: Prioritize colleges closest to the user's cutoff
+    recommendations.sort(key=lambda x: x['proximity'])
+    
+    return recommendations[:50]
+
+@app.post("/chat")
+async def chat_endpoint(request: QueryRequest, db: Session = Depends(get_db)):
+    if not AI_AVAILABLE:
+        return {
+            "answer": "The AI Assistant is temporarily unavailable. The AI engine failed to initialize (possible missing model). Please check server logs and ensure Ollama is running.",
+            "sources": [],
+            "strategy_alert": ""
+        }
+        
+    raw_query = request.query.strip()
+    query_lower = raw_query.lower()
+    session_id = request.session_id
+
+    # Conversational Memory Lookup
+    session = USER_SESSIONS.get(session_id, {})
+    user_cutoff = request.cutoff if request.cutoff is not None else session.get("cutoff", 0.0)
+    user_cat = request.category if request.category else session.get("category", "OC")
+
+    # -----------------------------------------------------------------
+    # SMART QUERY INTENT DETECTION
+    # -----------------------------------------------------------------
+    query_norm = query_lower.upper().replace(".", "").replace("?", "").replace("&", " AND ").replace("-", " ")
+    q_words = query_norm.split()
+
+    # Intent flags
+    is_fee_query = any(w in query_lower for w in ["fee", "fees", "tuition", "cost", "payment", "challan"])
+    is_scholarship_query = any(w in query_lower for w in ["scholarship", "concession", "free seat", "first graduate", "7.5"])
+    is_counselling_query = any(w in query_lower for w in ["process", "stages", "schedule", "round", "counselling", "counseling", "option filling", "allotment", "document", "verification"])
+    is_rank_query = any(w in query_lower for w in ["rank", "marks", "cutoff", "mark", "score"])
+    is_tfc_query = any(w in query_lower for w in ["tfc", "facilitation", "center", "centre", "help center"])
+    is_category_query = any(w in query_lower for w in ["oc", "bc", "mbc", "sc", "sca", "st", "category", "reservation"])
+    is_greeting = query_lower.strip() in ["hi", "hello", "hey", "who are you", "what can you do"]
+
+    # Branch detection
+    branch_filter = None
+    branch_map = {
+        "AIDS": "ARTIFICIAL INTELLIGENCE AND DATA SCIENCE",
+        "AD": "ARTIFICIAL INTELLIGENCE AND DATA SCIENCE",
+        "AI AND DS": "ARTIFICIAL INTELLIGENCE AND DATA SCIENCE",
+        "AIML": "ARTIFICIAL INTELLIGENCE AND MACHINE LEARNING",
+        "AI AND ML": "ARTIFICIAL INTELLIGENCE AND MACHINE LEARNING",
+        "CSE": "COMPUTER SCIENCE AND ENGINEERING",
+        "CS": "COMPUTER SCIENCE AND ENGINEERING",
+        "IT": "INFORMATION TECHNOLOGY",
+        "ECE": "ELECTRONICS AND COMMUNICATION ENGINEERING",
+        "EEE": "ELECTRICAL AND ELECTRONICS ENGINEERING",
+        "MECH": "MECHANICAL ENGINEERING",
+        "CIVIL": "CIVIL ENGINEERING",
+        "BM": "BIO MEDICAL ENGINEERING",
+        "BME": "BIO MEDICAL ENGINEERING",
+        "AI": "ARTIFICIAL INTELLIGENCE",
+        "DS": "DATA SCIENCE",
+        "CHEM": "CHEMICAL ENGINEERING",
+        "AERO": "AERONAUTICAL ENGINEERING",
+        "AUTO": "AUTOMOBILE ENGINEERING",
+        "BIOTECH": "BIOTECHNOLOGY",
+        "MBA": "MBA",
+        "MCA": "MCA",
+    }
+    for abbr, full in branch_map.items():
+        if abbr in q_words or f" {abbr} " in f" {query_norm} ":
+            branch_filter = full
+            break
+    if not branch_filter:
+        for b_name in ALL_BRANCHES:
+            b_norm = b_name.replace(".", "").upper()
+            if b_norm in query_norm:
+                branch_filter = b_name
+                break
+
+    # Words that are noise for college search (keep narrow — don't block "FEES")
+    NOISE_WORDS = {
+        "COLLEGE", "INSTITUTE", "ACADEMY", "UNIVERSITY", "AND", "OF", "THE",
+        "TELL", "WHAT", "NAME", "SHOW", "LIST", "ABOUT", "GIVE", "FIND",
+        "THESE", "THOSE", "WITH", "FOR", "FROM", "HAVE", "DOES", "WILL",
+        "PLEASE", "HELP", "KNOW", "WANT", "NEED", "HOW", "WHEN", "WHERE"
+    }
+    selective_words = [w for w in q_words if w not in NOISE_WORDS and len(w) >= 3]
+    is_general_query = not selective_words or all(
+        any(w in q for q in [
+            "process", "stage", "counselling", "counseling", "fee", "fees",
+            "scholarship", "document", "eligibility", "reservation", "round",
+            "option", "seat", "allot", "tfc", "category"
+        ])
+        for w in [s.lower() for s in selective_words]
+    )
+
+    # -----------------------------------------------------------------
+    # SQL RETRIEVAL — only if it's plausibly a college-specific query
+    # -----------------------------------------------------------------
+    sql_context = ""
+    if not is_general_query:
+        from sqlalchemy import func
+        matches = []
+        for word in selective_words[:5]:  # limit to first 5 meaningful words
+            q_sql = db.query(CollegeCutoff).filter(
+                func.replace(CollegeCutoff.college_name, ".", "").ilike(f"%{word}%")
+            )
+            if branch_filter:
+                q_sql = q_sql.filter(CollegeCutoff.branch_name.ilike(f"%{branch_filter}%"))
+            matches.extend(q_sql.limit(400).all())
+            if len(matches) >= 1500:
+                break
+
+        # De-duplicate and group by college + branch
+        c_grouped = {}
+        for m in matches:
+            b_key = (m.college_name, m.branch_name)
+            if b_key not in c_grouped:
+                if len(c_grouped) >= 12:
+                    break
+                c_grouped[b_key] = {
+                    "college_code": m.college_code,
+                    "district": m.district,
+                    "history": {"2025": [], "2024": [], "2023": [], "2022": [], "2021": []}
+                }
+            for yr in ["2021", "2022", "2023", "2024", "2025"]:
+                val = getattr(m, f"cutoff_{yr}", None)
+                if val:
+                    c_grouped[b_key]["history"][yr].append(val)
+
+        for (c_n, b_n), data in list(c_grouped.items())[:15]:
+            year_parts = []
+            for year in ["2025", "2024", "2023", "2022", "2021"]:
+                vals = data["history"][year]
+                if not vals:
+                    continue
+                lo, hi = min(vals), max(vals)
+                year_parts.append(f"{year}: {lo if lo == hi else f'{lo}–{hi}'}")
+            if year_parts:
+                sql_context += (
+                    f"\n• {c_n} (Code {data['college_code']}, {data['district']}) | "
+                    f"{b_n or 'General'} | Cutoffs — {', '.join(year_parts)}"
+                )
+
+        if not sql_context and matches:
+            for m in matches[:8]:
+                latest = m.cutoff_2025 or m.cutoff_2024 or m.cutoff_2023 or "N/A"
+                sql_context += f"\n• {m.branch_name} | Latest Cutoff: {latest}"
+
+    # -----------------------------------------------------------------
+    # VECTOR / RAG RETRIEVAL
+    # -----------------------------------------------------------------
+    try:
+        # Use a higher k for process/fee/general queries
+        k_val = 15 if is_general_query or is_fee_query or is_counselling_query else 8
+        docs = vector_db.similarity_search(raw_query, k=k_val)
+    except Exception:
+        docs = []
+
+    vector_context = "\n\n".join([d.page_content for d in docs])
+    citations = list(set(
+        f"{d.metadata.get('source')} (Page {d.metadata.get('page')})"
+        for d in docs
+        if d.metadata.get("source")
+    ))
+
+    # -----------------------------------------------------------------
+    # GREETING SHORTCUT
+    # -----------------------------------------------------------------
+    if is_greeting:
+        return {
+            "answer": (
+                "Hello! I'm your TNEA Pro AI counselling assistant. I can help you with:\n\n"
+                "- **College & Branch Cutoff History** — see past cutoff marks for any college or branch\n"
+                "- **Personalized Recommendations** — get Safe / Moderate / Dream college suggestions based on your score\n"
+                "- **Counselling Process** — understand the rounds, document verification, option filling, and allotment\n"
+                "- **Fees & Scholarships** — government tuition fee details, first-generation concessions, and more\n"
+                "- **TFC Center Info** — find facilitation centers near you for document help\n\n"
+                "What would you like to know? 😊"
+            ),
+            "sources": [],
+            "strategy_alert": ""
+        }
+
+    # -----------------------------------------------------------------
+    # COMPOSE FULL CONTEXT
+    # -----------------------------------------------------------------
+    context_parts = []
+    if sql_context:
+        context_parts.append(f"=== College Database Records ===\n{sql_context}")
+    if vector_context:
+        context_parts.append(f"=== Knowledge Base (PDF / Documents) ===\n{vector_context}")
+    full_context = "\n\n".join(context_parts) if context_parts else "No specific records found in the database for this query."
+
+    # -----------------------------------------------------------------
+    # SYSTEM PROMPT — STRICT RAG PERSONA
+    # -----------------------------------------------------------------
+    system_prompt = """You are TNEA Pro AI — a strict but helpful TNEA (Tamil Nadu Engineering Admissions) assistant.
+
+Your personality and rules:
+- You are friendly and structured.
+- You must ONLY answer based on the provided Context (College Database Records and Knowledge Base).
+- If the provided Context does not contain the answer to the student's question, you MUST clearly state: "I'm sorry, I don't have that information in my records."
+- Do NOT guess, do NOT hallucinate, and do NOT use any outside knowledge beyond what is explicitly provided in the Context.
+
+Output format rules:
+- Use **bold** for key terms, numbers, and college names
+- Use bullet points or numbered steps for processes
+- Keep your answers concise and directly based on the context.
+- End with a helpful follow-up suggestion based on the context."""
+
+    user_prompt = f"""Student Profile: Cutoff Mark = {user_cutoff or 'Not set'}, Category = {user_cat or 'OC'}
+
+Context:
+{full_context}
+
+Student's Question: {raw_query}
+
+Please answer strictly based on the Context above."""
+
+    # -----------------------------------------------------------------
+    # LLM CALL - Using Ollama (llama3)
+    # -----------------------------------------------------------------
+    try:
+        print("--- Attempting Ollama (llama3) ---")
+        chat_messages = [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt}
+        ]
+        
+        # Using llama3 as requested
+        response = ollama.chat(model='llama3', messages=chat_messages)
+        full_response = response['message']['content'].strip()
+        
+    except Exception as ollama_e:
+        print(f"--- Ollama Failed --- Error: {ollama_e}")
+        error_msg = str(ollama_e).lower()
+        if "connection" in error_msg or "refused" in error_msg:
+            return {
+                "answer": "I'm having trouble reaching the AI engine right now. Please make sure the Ollama service is running and try again in a moment.",
+                "sources": [],
+                "strategy_alert": "Tip: Open the Ollama app and ensure the service is active."
+            }
+        return {"answer": f"Unexpected error: {str(ollama_e)}", "sources": []}
+
+    # Generate a strategy tip for cutoff-related queries
+    strategy_alert = ""
+    if user_cutoff and (is_rank_query or is_general_query) and float(user_cutoff) > 0:
+        if float(user_cutoff) >= 190:
+            strategy_alert = f"With a cutoff of {user_cutoff}, you're in a strong position! Focus on top Government colleges in your preferred district first."
+        elif float(user_cutoff) >= 175:
+            strategy_alert = f"Your cutoff of {user_cutoff} gives you solid options across Government and Aided colleges. Consider a mix of safe + aspirational choices."
+        elif float(user_cutoff) >= 150:
+            strategy_alert = f"With {user_cutoff}, aim for aided and self-financing colleges in your core branch. Widen your district scope for better picks."
+
+    return {
+        "answer": full_response,
+        "sources": citations,
+        "strategy_alert": strategy_alert
+    }
+def get_or_create_college(college_code: str, db: Session) -> Optional[College]:
+    # Normalize college code to 4-digit string
+    code_str = str(college_code).strip().zfill(4)
+    
+    college = db.query(College).filter(College.college_code == code_str).first()
+    if college:
+        return college
+        
+    # Fallback search by code as an integer
+    try:
+        code_int = int(college_code)
+        college = db.query(College).filter(College.college_code == str(code_int).zfill(4)).first()
+        if college:
+            return college
+    except ValueError:
+        pass
+
+    # Fallback to check if it exists in Cutoffs database, and if so, dynamically heal/create master record
+    try:
+        code_val = int(code_str)
+    except ValueError:
+        code_val = None
+        
+    cutoff_record = None
+    if code_val is not None:
+        cutoff_record = db.query(CollegeCutoff).filter(
+            (CollegeCutoff.college_code == code_val) | 
+            (CollegeCutoff.college_code == code_str)
+        ).filter(CollegeCutoff.branch_name.isnot(None)).first()
+    else:
+        cutoff_record = db.query(CollegeCutoff).filter(
+            CollegeCutoff.college_code == code_str
+        ).filter(CollegeCutoff.branch_name.isnot(None)).first()
+        
+    if cutoff_record:
+        # Dynamically seed/create master record to prevent 404
+        college = College(
+            college_code=code_str,
+            college_name=cutoff_record.college_name,
+            district=cutoff_record.district,
+            autonomous_status=False,
+            minority_status=False,
+            principal_name="Not Available",
+            address="Address details not available in JSON source.",
+            taluk="N/A",
+            pincode="N/A",
+            parse_confidence=0.5
+        )
+        db.add(college)
+        db.commit()
+        db.refresh(college)
+        
+        # Create empty contacts, hostel, transport
+        contact = Contact(college_id=college.id, phone="", email="", website="", anti_ragging_phone="")
+        hostel = HostelDetails(
+            college_id=college.id, 
+            boys_hostel_available=False, 
+            girls_hostel_available=False,
+            mess_bill=0.0,
+            room_rent=0.0,
+            electricity_charges=0.0,
+            caution_deposit=0.0,
+            establishment_charges=0.0
+        )
+        transport = TransportDetails(
+            college_id=college.id, 
+            facilities_available=False,
+            min_transport_charges=0.0,
+            max_transport_charges=0.0,
+            nearest_railway_station="Not Specified",
+            railway_distance_km=0.0
+        )
+        db.add(contact)
+        db.add(hostel)
+        db.add(transport)
+        
+        # Seed courses from CollegeCutoff branch names for complete robust views
+        cutoff_branches = db.query(CollegeCutoff.branch_name).filter(
+            (CollegeCutoff.college_code == code_val) | 
+            (CollegeCutoff.college_code == code_str)
+        ).filter(CollegeCutoff.branch_name.isnot(None)).distinct().all()
+        
+        for (b_name,) in cutoff_branches:
+            if not b_name:
+                continue
+            words = [w for w in b_name.split() if w.isalnum()]
+            if len(words) >= 3:
+                b_code = "".join([w[0] for w in words])[:4].upper()
+            elif len(words) == 2:
+                b_code = (words[0][:2] + words[1][:2]).upper()
+            else:
+                b_code = words[0][:4].upper() if words else "GEN"
+                
+            course = Course(
+                college_id=college.id,
+                branch_code=b_code,
+                branch_name=b_name,
+                approved_intake=60,
+                year_started=None,
+                accredited=False,
+                accredited_valid_upto="-"
+            )
+            db.add(course)
+            
+        db.commit()
+        db.refresh(college)
+        return college
+    return None
+
+@app.get("/college/search")
+async def search_colleges(
+    district: Optional[str] = None,
+    branch: Optional[str] = None,
+    name: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    query = db.query(College)
+    
+    if district:
+        query = query.filter(College.district.ilike(f"%{district.strip()}%"))
+    
+    if name:
+        query = query.filter(College.college_name.ilike(f"%{name.strip()}%"))
+        
+    if branch:
+        # Join with Course table to search by branch/course name or code
+        query = query.join(Course).filter(
+            (Course.branch_name.ilike(f"%{branch.strip()}%")) | 
+            (Course.branch_code.ilike(f"%{branch.strip()}%"))
+        )
+        
+    colleges = query.distinct().limit(100).all()
+    
+    results = []
+    for c in colleges:
+        contact = db.query(Contact).filter(Contact.college_id == c.id).first()
+        results.append({
+            "college_code": c.college_code,
+            "college_name": c.college_name,
+            "district": c.district,
+            "autonomous_status": c.autonomous_status,
+            "website": contact.website if contact else ""
+        })
+        
+    return results
+
+@app.get("/college/{college_code}/insights")
+def get_college_insights(college_code: str, db: Session = Depends(get_db)):
+    code_str = str(college_code).strip().zfill(4)
+    college = get_or_create_college(code_str, db)
+    if not college:
+        raise HTTPException(status_code=404, detail="College not found")
+        
+    courses = db.query(Course).filter(Course.college_id == college.id).all()
+    course_names = [c.branch_name for c in courses if c.branch_name][:8]
+    
+    real_info = f"College Name: {college.college_name}\n"
+    real_info += f"Location: {college.district}\n"
+    real_info += f"Status: {'Autonomous' if college.autonomous_status else 'Non-Autonomous'}\n"
+    if course_names:
+        real_info += f"Some Courses: {', '.join(course_names)}\n"
+        
+    prompt = f"""Based on the following real data: {real_info}.
+Provide a brief, engaging overview (3-4 sentences max) of the college.
+Please mention placements, staff quality, and courses offered. 
+If you know specific details about placements or staff for this exact college from your knowledge base, include them. If not, give a general encouraging statement about career prospects and teaching quality for these courses.
+Use very simple, easy-to-understand English. Do not make it too long."""
+    
+    try:
+        import ollama
+        response = ollama.chat(model='llama3', messages=[{'role': 'user', 'content': prompt}])
+        insights = response['message']['content'].strip()
+    except Exception:
+        insights = f"{college.college_name} is an {'autonomous' if college.autonomous_status else 'engineering'} institution in {college.district}. It offers courses like {', '.join(course_names[:3])}."
+        
+    return {"insights": insights}
+@app.get("/college/{college_code}")
+async def get_college_profile(college_code: str, db: Session = Depends(get_db)):
+    # Normalize college code to 4-digit string
+    code_str = str(college_code).strip().zfill(4)
+    
+    college = get_or_create_college(code_str, db)
+    if not college:
+        raise HTTPException(status_code=404, detail="College not found")
+
+    # Fetch related details
+    contact = db.query(Contact).filter(Contact.college_id == college.id).first()
+    hostel = db.query(HostelDetails).filter(HostelDetails.college_id == college.id).first()
+    transport = db.query(TransportDetails).filter(TransportDetails.college_id == college.id).first()
+    courses = db.query(Course).filter(Course.college_id == college.id).all()
+    
+    # Query cutoff trends for this college code
+    try:
+        code_val = int(code_str)
+    except ValueError:
+        code_val = code_str
+
+    cutoffs = db.query(CollegeCutoff).filter(
+        (CollegeCutoff.college_code == code_val) | 
+        (CollegeCutoff.college_code == code_str)
+    ).all()
+
+    # Get historical notes from Vector DB
+    historical_notes = []
+    if AI_AVAILABLE and vector_db:
+        try:
+            rag_docs = vector_db.similarity_search(f"Historical data for college code {code_str}", k=10)
+            historical_notes = [d.page_content for d in rag_docs if str(d.metadata.get('college_code')) == str(code_val)]
+        except Exception:
+            pass
+
+    # Map branches cutoff history
+    branches_cutoff = {}
+    for col in cutoffs:
+        b_name = col.branch_name or "General"
+        if b_name not in branches_cutoff:
+            branches_cutoff[b_name] = {}
+        
+        cat = col.category
+        branches_cutoff[b_name][cat] = {
+            "2021": round(col.cutoff_2021, 2) if col.cutoff_2021 else None,
+            "2022": round(col.cutoff_2022, 2) if col.cutoff_2022 else None,
+            "2023": round(col.cutoff_2023, 2) if col.cutoff_2023 else None,
+            "2024": round(col.cutoff_2024, 2) if col.cutoff_2024 else None,
+            "2025": round(col.cutoff_2025, 2) if col.cutoff_2025 else None,
+        }
+
+    return {
+        "id": college.id,
+        "code": college.college_code,
+        "name": college.college_name,
+        "principal_name": college.principal_name,
+        "address": college.address,
+        "district": college.district,
+        "taluk": college.taluk,
+        "pincode": college.pincode,
+        "autonomous_status": college.autonomous_status,
+        "minority_status": college.minority_status,
+        "parse_confidence": college.parse_confidence,
+        "category_type": "Autonomous" if college.autonomous_status else "Non-Autonomous",
+        "contact": {
+            "phone": contact.phone if contact else "",
+            "email": contact.email if contact else "",
+            "website": contact.website if contact else "",
+            "anti_ragging_phone": contact.anti_ragging_phone if contact else ""
+        },
+        "hostel": {
+            "boys_hostel_available": hostel.boys_hostel_available if hostel else False,
+            "girls_hostel_available": hostel.girls_hostel_available if hostel else False,
+            "mess_bill": hostel.mess_bill if hostel else 0.0,
+            "room_rent": hostel.room_rent if hostel else 0.0,
+            "electricity_charges": hostel.electricity_charges if hostel else 0.0,
+            "caution_deposit": hostel.caution_deposit if hostel else 0.0,
+            "establishment_charges": hostel.establishment_charges if hostel else 0.0
+        },
+        "transport": {
+            "facilities_available": transport.facilities_available if transport else False,
+            "min_transport_charges": transport.min_transport_charges if transport else 0.0,
+            "max_transport_charges": transport.max_transport_charges if transport else 0.0,
+            "nearest_railway_station": transport.nearest_railway_station if transport else "",
+            "railway_distance_km": transport.railway_distance_km if transport else 0.0
+        },
+        "courses": [
+            {
+                "branch_code": c.branch_code,
+                "branch_name": c.branch_name,
+                "approved_intake": c.approved_intake,
+                "year_started": c.year_started,
+                "accredited": c.accredited,
+                "accredited_valid_upto": c.accredited_valid_upto
+            } for c in courses
+        ],
+        "branches": branches_cutoff,
+        "historical_trends": historical_notes
+    }
+
+@app.get("/college/{college_code}/courses")
+async def get_college_courses(college_code: str, db: Session = Depends(get_db)):
+    code_str = str(college_code).strip().zfill(4)
+    college = get_or_create_college(code_str, db)
+    if not college:
+        raise HTTPException(status_code=404, detail="College not found")
+    courses = db.query(Course).filter(Course.college_id == college.id).all()
+    return [
+        {
+            "branch_code": c.branch_code,
+            "branch_name": c.branch_name,
+            "approved_intake": c.approved_intake,
+            "year_started": c.year_started,
+            "accredited": c.accredited,
+            "accredited_valid_upto": c.accredited_valid_upto
+        } for c in courses
+    ]
+
+@app.get("/college/{college_code}/hostel")
+async def get_college_hostel(college_code: str, db: Session = Depends(get_db)):
+    code_str = str(college_code).strip().zfill(4)
+    college = get_or_create_college(code_str, db)
+    if not college:
+        raise HTTPException(status_code=404, detail="College not found")
+    hostel = db.query(HostelDetails).filter(HostelDetails.college_id == college.id).first()
+    if not hostel:
+        return {"boys_hostel_available": False, "girls_hostel_available": False, "mess_bill": 0, "room_rent": 0, "electricity_charges": 0, "caution_deposit": 0, "establishment_charges": 0}
+    return {
+        "boys_hostel_available": hostel.boys_hostel_available,
+        "girls_hostel_available": hostel.girls_hostel_available,
+        "mess_bill": hostel.mess_bill,
+        "room_rent": hostel.room_rent,
+        "electricity_charges": hostel.electricity_charges,
+        "caution_deposit": hostel.caution_deposit,
+        "establishment_charges": hostel.establishment_charges
+    }
+
+@app.get("/college/{college_code}/transport")
+async def get_college_transport(college_code: str, db: Session = Depends(get_db)):
+    code_str = str(college_code).strip().zfill(4)
+    college = get_or_create_college(code_str, db)
+    if not college:
+        raise HTTPException(status_code=404, detail="College not found")
+    transport = db.query(TransportDetails).filter(TransportDetails.college_id == college.id).first()
+    if not transport:
+        return {"facilities_available": False, "min_transport_charges": 0, "max_transport_charges": 0, "nearest_railway_station": "", "railway_distance_km": 0}
+    return {
+        "facilities_available": transport.facilities_available,
+        "min_transport_charges": transport.min_transport_charges,
+        "max_transport_charges": transport.max_transport_charges,
+        "nearest_railway_station": transport.nearest_railway_station,
+        "railway_distance_km": transport.railway_distance_km
+    }
+
+
+
+@app.get("/directory")
+async def get_directory(
+    response: Response,
+    search: Optional[str] = None,
+    districts: Optional[List[str]] = Query(None),
+    branches: Optional[List[str]] = Query(None),
+    institution_type: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1),
+    db: Session = Depends(get_db)
+):
+    from sqlalchemy import or_, and_, cast, String, func, Integer
+
+    # --- Cache lookup (skip DB entirely for repeated identical requests) ---
+    search_norm = (search or "").strip().lower()
+    districts_norm = tuple(sorted(d.strip().lower() for d in (districts or []) if d.strip()))
+    branches_norm = tuple(sorted(b.strip().lower() for b in (branches or []) if b.strip()))
+    type_norm = institution_type.strip().lower() if institution_type else ""
+    cache_key = (search_norm, districts_norm, branches_norm, type_norm)
+
+    result = _get_directory_cache(cache_key)
+
+    if result is None:
+        # --- Full DB query + grouping (only runs on cache miss) ---
+        query = db.query(
+            CollegeCutoff.college_code,
+            CollegeCutoff.college_name,
+            func.coalesce(College.district, CollegeCutoff.district).label("district"),
+            CollegeCutoff.branch_name,
+            func.min(func.coalesce(
+                CollegeCutoff.cutoff_2025,
+                CollegeCutoff.cutoff_2024,
+                CollegeCutoff.cutoff_2023,
+                CollegeCutoff.cutoff_2022,
+                CollegeCutoff.cutoff_2021
+            )).label("min_c"),
+            func.max(
+                func.max(
+                    func.coalesce(CollegeCutoff.cutoff_2025, 0),
+                    func.coalesce(CollegeCutoff.cutoff_2024, 0),
+                    func.coalesce(CollegeCutoff.cutoff_2023, 0),
+                    func.coalesce(CollegeCutoff.cutoff_2022, 0),
+                    func.coalesce(CollegeCutoff.cutoff_2021, 0)
+                )
+            ).label("max_c")
+        ).outerjoin(College, cast(College.college_code, Integer) == CollegeCutoff.college_code).filter(
+            CollegeCutoff.branch_name.isnot(None),
+            (CollegeCutoff.cutoff_2025 > 0) |
+            (CollegeCutoff.cutoff_2024 > 0) |
+            (CollegeCutoff.cutoff_2023 > 0) |
+            (CollegeCutoff.cutoff_2022 > 0) |
+            (CollegeCutoff.cutoff_2021 > 0)
+        )
+
+        if search_norm:
+            tokens = search_norm.split()
+            if tokens:
+                conditions = []
+                for token in tokens:
+                    token_conds = [
+                        CollegeCutoff.college_name.ilike(f"%{token}%"),
+                        func.coalesce(College.district, CollegeCutoff.district).ilike(f"%{token}%"),
+                        cast(CollegeCutoff.college_code, String).ilike(f"%{token}%")
+                    ]
+                    conditions.append(or_(*token_conds))
+                query = query.filter(and_(*conditions))
+
+        if districts:
+            dist_conditions = []
+            for d in districts:
+                d_clean = d.strip().replace(".", "").upper()
+                if d_clean:
+                    if d_clean in ["CHENGALPATTU", "CHENGALPET"]:
+                        dist_conditions.append(or_(
+                            College.district.ilike("%Chengalpattu%"),
+                            College.district.ilike("%Chengalpet%"),
+                            CollegeCutoff.district.ilike("%Chengalpattu%"),
+                            CollegeCutoff.district.ilike("%Chengalpet%")
+                        ))
+                    elif d_clean in ["KANCHIPURAM", "KANJEERAPURAM"]:
+                        dist_conditions.append(or_(
+                            College.district.ilike("%Kanchipuram%"),
+                            College.district.ilike("%Kancheepuram%"),
+                            CollegeCutoff.district.ilike("%Kanchipuram%"),
+                            CollegeCutoff.district.ilike("%Kancheepuram%")
+                        ))
+                    else:
+                        dist_conditions.append(or_(
+                            College.district.ilike(f"%{d}%"),
+                            CollegeCutoff.district.ilike(f"%{d}%")
+                        ))
+            if dist_conditions:
+                query = query.filter(or_(*dist_conditions))
+
+        if branches:
+            branch_conditions = []
+            for b in branches:
+                b_clean = b.strip().upper().replace(".", "")
+                if b_clean:
+                    branch_conditions.append(get_branch_filter_condition(b_clean))
+            if branch_conditions:
+                query = query.filter(or_(*branch_conditions))
+
+        if institution_type and institution_type.lower() != "all":
+            # For now, our DB is entirely Engineering. So if they ask for something else, return nothing.
+            if institution_type.lower() != "engineering":
+                query = query.filter(False)  # This will return an empty result set
+
+        rows = query.group_by(
+            CollegeCutoff.college_code,
+            CollegeCutoff.branch_name
+        ).order_by(CollegeCutoff.college_name).all()
+
+        directory: Dict[str, dict] = {}
+        for code_raw, name, district, branch, min_c, max_c in rows:
+            if not code_raw:
+                continue
+            code = str(code_raw).strip().zfill(4)
+            if code not in directory:
+                directory[code] = {
+                    "name": name,
+                    "district": clean_district_name(district),
+                    "code": code,
+                    "type": "Engineering", # Defaulting to Engineering
+                    "branches": {}
+                }
+            if branch and min_c is not None and max_c is not None:
+                b_cleaned = clean_branch_name(branch)
+                if b_cleaned in directory[code]["branches"]:
+                    old_min = directory[code]["branches"][b_cleaned]["min"]
+                    old_max = directory[code]["branches"][b_cleaned]["max"]
+                    directory[code]["branches"][b_cleaned]["min"] = min(old_min, min_c)
+                    directory[code]["branches"][b_cleaned]["max"] = max(old_max, max_c)
+                else:
+                    directory[code]["branches"][b_cleaned] = {"min": min_c, "max": max_c}
+
+        result = []
+        for item in directory.values():
+            item["branches"] = [
+                {"name": b_name, "min": round(b_range["min"], 2), "max": round(b_range["max"], 2)}
+                for b_name, b_range in item["branches"].items()
+            ]
+            result.append(item)
+
+        _set_directory_cache(cache_key, result)
+
+    # --- Pagination (always applied, even from cache) ---
+    total_colleges = len(result)
+    start_idx = (page - 1) * limit
+    paginated = result[start_idx: start_idx + limit]
+
+    # Attach real courses from Course table for the paginated items
+    page_codes = [p["code"] for p in paginated]
+    if page_codes:
+        page_cols = db.query(College).filter(College.college_code.in_(page_codes)).all()
+        cid_to_code = {c.id: str(c.college_code).strip().zfill(4) for c in page_cols}
+        
+        c_query = db.query(Course).filter(Course.college_id.in_(cid_to_code.keys())).all()
+        courses_by_code = {code: [] for code in page_codes}
+        for c in c_query:
+            if c.branch_name:
+                code = cid_to_code[c.college_id]
+                if code in courses_by_code:
+                    courses_by_code[code].append(c.branch_name)
+                    
+        for item in paginated:
+            item["courses"] = list(set(courses_by_code.get(item["code"], [])))
+
+    # Tell browser to cache for 60 s (reduces even initial duplicate requests)
+    response.headers["Cache-Control"] = "public, max-age=60"
+
+    return {
+        "total": total_colleges,
+        "page": page,
+        "limit": limit,
+        "pages": (total_colleges + limit - 1) // limit,
+        "colleges": paginated
+    }
+
+
+@app.get("/metadata")
+async def get_metadata(db: Session = Depends(get_db)):
+    # Query all unique non-null actual districts from College table
+    districts = db.query(College.district).filter(College.district.isnot(None)).distinct().all()
+    branches = db.query(CollegeCutoff.branch_name).filter(CollegeCutoff.branch_name.isnot(None)).distinct().all()
+    
+    # Clean districts to include only clean district names, no places/taluks
+    cleaned_districts = set()
+    for d in districts:
+        if d[0]:
+            cleaned_districts.add(clean_district_name(d[0]))
+            
+    # Clean and deduplicate branches (e.g. merge Agricultural vs Agriculture Engineering)
+    cleaned_branches = set()
+    for b in branches:
+        if b[0]:
+            cleaned_branches.add(clean_branch_name(b[0]))
+    
+    return {
+        "districts": sorted(list(cleaned_districts)),
+        "branches": sorted(list(cleaned_branches)),
+        "institution_types": ["Engineering", "Arts & Science", "Medical", "Law", "Management"]
+    }
+
+
+@app.get("/tfc")
+async def get_tfc_centers(db: Session = Depends(get_db)):
+    return db.query(TFCCenter).limit(100).all()
+
+@app.post("/choice/add")
+async def add_choice(session_id: str, college_data: dict):
+    if session_id not in USER_CHOICES:
+        USER_CHOICES[session_id] = []
+    
+    # Avoid duplicates and handle missing keys safely (Type-insensitive comparison)
+    new_code = str(college_data.get('code', '0000'))
+    new_branch = str(college_data.get('branch', 'General'))
+    
+    is_duplicate = any(
+        str(c.get('code')) == new_code and str(c.get('branch')) == new_branch 
+        for c in USER_CHOICES[session_id]
+    )
+    
+    if not is_duplicate:
+        college_data.setdefault("notes", "")
+        USER_CHOICES[session_id].append(college_data)
+    
+    return {"status": "success", "count": len(USER_CHOICES[session_id])}
+
+@app.post("/choice/remove")
+async def remove_choice(session_id: str, college_data: dict):
+    if session_id in USER_CHOICES:
+        code = str(college_data.get('code', '0000'))
+        branch = str(college_data.get('branch', 'General'))
+        USER_CHOICES[session_id] = [
+            c for c in USER_CHOICES[session_id]
+            if not (str(c.get('code')) == code and str(c.get('branch')) == branch)
+        ]
+    return {"status": "success", "count": len(USER_CHOICES.get(session_id, []))}
+
+@app.get("/choice/{session_id}")
+async def get_choices(session_id: str):
+    return USER_CHOICES.get(session_id, [])
+
+@app.post("/choice/clear")
+async def clear_choices(session_id: str):
+    if session_id in USER_CHOICES:
+        USER_CHOICES[session_id] = []
+    return {"status": "success", "count": 0}
+
+@app.post("/choice/reorder")
+async def reorder_choices(session_id: str, direction: str, index: int):
+    if session_id in USER_CHOICES:
+        choices = USER_CHOICES[session_id]
+        n = len(choices)
+        if direction == "up" and 0 < index < n:
+            choices[index], choices[index - 1] = choices[index - 1], choices[index]
+        elif direction == "down" and 0 <= index < n - 1:
+            choices[index], choices[index + 1] = choices[index + 1], choices[index]
+    return {"status": "success", "choices": USER_CHOICES.get(session_id, [])}
+
+@app.post("/choice/notes")
+async def update_choice_notes(session_id: str, index: int, notes: str):
+    if session_id in USER_CHOICES and 0 <= index < len(USER_CHOICES[session_id]):
+        USER_CHOICES[session_id][index]["notes"] = notes
+    return {"status": "success", "choices": USER_CHOICES.get(session_id, [])}
+
+# --- Cutoff Calculator Endpoints ---
+class CutoffCalcRequest(BaseModel):
+    maths: float
+    physics: float
+    chemistry: float
+    category: str
+    district: str
+    preferred_branch: str
+
+class CutoffCalcResponse(BaseModel):
+    cutoff: float
+    eligibility_tier: str
+    recommendation_summary: str
+    suggested_branches: List[str]
+
+@app.post("/calculate-cutoff", response_model=CutoffCalcResponse)
+async def calculate_cutoff(req: CutoffCalcRequest, db: Session = Depends(get_db)):
+    # Standard TNEA Cutoff formula: Maths (out of 100) + Physics/2 (out of 50) + Chemistry/2 (out of 50)
+    # This equals (Maths / 2.0) + (Physics / 4.0) + (Chemistry / 4.0) multiplied by 2 to yield a score out of 200.
+    cutoff_200 = float(req.maths + (req.physics / 2.0) + (req.chemistry / 2.0))
+    cutoff_200 = min(200.0, max(0.0, cutoff_200)) # clamp between 0 and 200
+    
+    # Query historic cutoff bounds in SQLite to get expected college metrics
+    # We join College to filter by district if specified
+    query = db.query(CollegeCutoff, College).join(College, College.college_code == CollegeCutoff.college_code)
+    
+    # Apply category filter
+    query = query.filter(CollegeCutoff.category == req.category)
+    
+    # Apply branch filter if valid
+    branch_clean = req.preferred_branch.strip() if req.preferred_branch else ""
+    if branch_clean and branch_clean.lower() != "all" and branch_clean.lower() != "any":
+        query = query.filter(CollegeCutoff.branch_name.ilike(f"%{branch_clean}%"))
+        
+    # Apply district filter if valid
+    district_clean = req.district.strip() if req.district else ""
+    if district_clean and district_clean.lower() != "all" and district_clean.lower() != "any":
+        query = query.filter(College.district.ilike(f"%{district_clean}%"))
+        
+    results = query.all()
+    
+    safe_count = 0
+    mod_count = 0
+    dream_count = 0
+    
+    for cutoff_row, college in results:
+        closing = cutoff_row.cutoff_2025
+        if not closing:
+            closing = cutoff_row.cutoff_2024
+        if not closing:
+            continue
+            
+        if cutoff_200 >= closing + 5.0:
+            safe_count += 1
+        elif cutoff_200 >= closing - 5.0:
+            mod_count += 1
+        else:
+            dream_count += 1
+            
+    # Classify overall eligibility tier
+    if cutoff_200 >= 175.0:
+        eligibility_tier = "Safe (Tier-1 Elite)"
+    elif cutoff_200 >= 135.0:
+        eligibility_tier = "Moderate (Tier-2 Mid)"
+    else:
+        eligibility_tier = "Dream (Tier-3 Aspirational)"
+        
+    # Build personalized recommendation summary
+    loc_str = f"in **{district_clean}**" if district_clean and district_clean.lower() != "all" else "across Tamil Nadu"
+    branch_str = f"**{branch_clean}**" if branch_clean and branch_clean.lower() != "all" else "engineering courses"
+    
+    if safe_count > 0 or mod_count > 0:
+        summary = (
+            f"Based on your calculated TNEA Cutoff of **{cutoff_200:.2f}/200** and category **{req.category}**, "
+            f"we identified **{safe_count} Safe** backups and **{mod_count} Moderate** college programs offering {branch_str} {loc_str}. "
+            f"You have a highly secure foundation for counselling!"
+        )
+    else:
+        summary = (
+            f"Your calculated TNEA Cutoff is **{cutoff_200:.2f}/200** under category **{req.category}**. "
+            f"Historic cutoff data indicates that {branch_str} {loc_str} is extremely competitive. "
+            f"We recommend expanding your preferred branches or districts in the College Finder to see more matches."
+        )
+        
+    # Suitability branches suggestion based on selection
+    suggested = ["Computer Science", "Information Technology", "AI & Data Science", "Electronics & Communication"]
+    if branch_clean:
+        b_lower = branch_clean.lower()
+        if "mech" in b_lower or "civil" in b_lower:
+            suggested = ["Mechanical Engineering", "Civil Engineering", "Robotics & Automation", "Electrical & Electronics"]
+        elif "elect" in b_lower or "ece" in b_lower or "eee" in b_lower:
+            suggested = ["Electronics & Communication", "Electrical & Electronics", "Instrumentation & Control", "Computer Science"]
+            
+    return {
+        "cutoff": cutoff_200,
+        "eligibility_tier": eligibility_tier,
+        "recommendation_summary": summary,
+        "suggested_branches": suggested
+    }
+
+@app.get("/rag_records")
+async def get_rag_records(search: Optional[str] = None):
+    if not AI_AVAILABLE or not vector_db:
+        return {"count": 0, "records": []}
+        
+    # Get documents from the specific source we just ingested
+    collection = vector_db._collection
+    
+    # Building query
+    query_params = {"where": {"source": "tnea_cutoff_all.json"}}
+    if search:
+        query_params["limit"] = 100
+    else:
+        query_params["limit"] = 100 
+        
+    results = collection.get(**query_params)
+    
+    documents = results.get('documents', [])
+    metadatas = results.get('metadatas', [])
+    
+    records = []
+    for doc, meta in zip(documents, metadatas):
+        # Extract college name from doc content
+        import re
+        match = re.search(r"College: (.*?) \(Code:", doc)
+        college_name = match.group(1) if match else "Unknown"
+        
+        branch_match = re.search(r"Branch: (.*?) \(", doc)
+        branch_name = branch_match.group(1) if branch_match else "Unknown"
+        
+        records.append({
+            "code": meta.get('college_code') or "0000",
+            "name": college_name or "Unknown College",
+            "branch": branch_name or "General",
+            "district": meta.get('district') or "Unknown",
+            "content": doc
+        })
+        
+    return {
+        "count": collection.count(),
+        "records": records
+    }
+
+@app.get("/health")
+async def health(db: Session = Depends(get_db)):
+    db_status = "connected"
+    try:
+        db.execute(func.now())
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+    return {
+        "backend": "healthy",
+        "ai_available": AI_AVAILABLE,
+        "ai_error": AI_ERROR,
+        "chroma_path": CHROMA_PATH,
+        "chroma_exists": os.path.exists(CHROMA_PATH),
+        "groq_configured": bool(GROQ_API_KEY),
+        "database": db_status
+    }
+
+# ─── AUTH ENDPOINTS ───────────────────────────────────────────────────────────
+
+def hash_otp(otp: str) -> str:
+    return hashlib.sha256(otp.encode()).hexdigest()
+
+class SendOTPRequest(BaseModel):
+    mobile: str
+    name: Optional[str] = None
+
+class VerifyOTPRequest(BaseModel):
+    mobile: str
+    otp: str
+    name: Optional[str] = None
+    dob: Optional[str] = None
+    role: Optional[str] = "student"
+
+class LoginRequest(BaseModel):
+    mobile: str
+    dob: str
+    role: Optional[str] = "student"
+
+class LoginResponse(BaseModel):
+    success: bool
+    message: str
+    user: Optional[dict] = None
+
+@app.post("/auth/send-otp")
+async def send_otp(request: SendOTPRequest, db: Session = Depends(get_db)):
+    """Generate and store OTP. In production, integrate SMS provider here."""
+    mobile = request.mobile.strip()
+    if len(mobile) != 10 or not mobile.isdigit():
+        raise HTTPException(status_code=400, detail="Invalid mobile number")
+    
+    # Generate 4-digit OTP
+    otp = str(random.randint(1000, 9999))
+    
+    # Store OTP in DB (upsert pattern)
+    existing = db.query(OTPStore).filter(OTPStore.mobile == mobile).first()
+    if existing:
+        existing.otp = otp
+        existing.created_at = datetime.utcnow()
+        existing.verified = False
+    else:
+        otp_record = OTPStore(mobile=mobile, otp=otp, created_at=datetime.utcnow(), verified=False)
+        db.add(otp_record)
+    db.commit()
+    
+    print(f"--- OTP for {mobile}: {otp} ---")  # In production, send via SMS
+    
+    # In production: integrate MSG91 / Twilio here
+    # For now: return OTP in response (remove this in production, send via SMS)
+    return {
+        "success": True,
+        "message": f"OTP sent to +91 {mobile}",
+        "dev_otp": otp,  # REMOVE IN PRODUCTION - for development only
+    }
+
+@app.post("/auth/verify-otp")
+async def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
+    """Verify OTP and create user account if new."""
+    mobile = request.mobile.strip()
+    otp = request.otp.strip()
+    
+    # Check OTP from DB
+    otp_record = db.query(OTPStore).filter(OTPStore.mobile == mobile).first()
+    if not otp_record:
+        raise HTTPException(status_code=400, detail="No OTP sent to this number. Please request OTP first.")
+    
+    # Check expiry (10 min)
+    elapsed = (datetime.utcnow() - otp_record.created_at).total_seconds()
+    if elapsed > 600:
+        raise HTTPException(status_code=400, detail="OTP has expired. Please request a new OTP.")
+    
+    if otp_record.otp != otp:
+        raise HTTPException(status_code=400, detail="Incorrect OTP. Please try again.")
+    
+    # Mark OTP as verified
+    otp_record.verified = True
+    db.commit()
+    
+    # Create or fetch user
+    user = db.query(User).filter(User.mobile == mobile).first()
+    if not user:
+        recovery_id = f"TNEDU-{datetime.utcnow().year}-{random.randint(100000, 999999)}"
+        user = User(
+            mobile=mobile,
+            name=request.name or "Student",
+            dob=request.dob or "",
+            role=request.role or "student",
+            recovery_id=recovery_id,
+            created_at=datetime.utcnow(),
+            last_login=datetime.utcnow()
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        is_new_user = True
+    else:
+        user.last_login = datetime.utcnow()
+        if request.name and user.name == "Student":
+            user.name = request.name
+        if request.dob and not user.dob:
+            user.dob = request.dob
+        db.commit()
+        is_new_user = False
+    
+    return {
+        "success": True,
+        "is_new_user": is_new_user,
+        "user": {
+            "id": user.id,
+            "mobile": user.mobile,
+            "name": user.name,
+            "role": user.role,
+            "recovery_id": user.recovery_id,
+        }
+    }
+
+@app.post("/auth/login", response_model=LoginResponse)
+async def login(request: LoginRequest, db: Session = Depends(get_db)):
+    """Login with mobile + date of birth."""
+    mobile = request.mobile.strip()
+    
+    user = db.query(User).filter(User.mobile == mobile).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="No account found with this mobile number. Please sign up first.")
+    
+    # Verify DOB
+    if user.dob and request.dob and user.dob != request.dob:
+        raise HTTPException(status_code=401, detail="Date of birth does not match our records.")
+    
+    user.last_login = datetime.utcnow()
+    db.commit()
+    
+    return {
+        "success": True,
+        "message": "Login successful",
+        "user": {
+            "id": user.id,
+            "mobile": user.mobile,
+            "name": user.name,
+            "role": user.role,
+            "recovery_id": user.recovery_id,
+            "dob": user.dob,
+        }
+    }
+
+@app.get("/auth/user/{mobile}")
+async def get_user_by_mobile(mobile: str, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.mobile == mobile).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        "id": user.id,
+        "mobile": user.mobile,
+        "name": user.name,
+        "role": user.role,
+        "recovery_id": user.recovery_id,
+        "dob": user.dob,
+    }
+
+# ─── PROFILE ENDPOINTS ────────────────────────────────────────────────────────
+
+class ProfileUpsertRequest(BaseModel):
+    profile_id: str
+    user_mobile: str
+    name: str
+    relation: Optional[str] = "self"
+    standard: Optional[str] = None
+    board: Optional[str] = None
+    district: Optional[str] = None
+    school: Optional[str] = None
+    community: Optional[str] = None
+    dob: Optional[str] = None
+    maths: Optional[float] = None
+    physics: Optional[float] = None
+    chemistry: Optional[float] = None
+    computed_cutoff: Optional[float] = None
+    interests: Optional[List[str]] = []
+    career_goals: Optional[List[str]] = []
+    strong_subjects: Optional[List[str]] = []
+    weak_subjects: Optional[List[str]] = []
+    preferred_location: Optional[str] = None
+    hostel_required: Optional[str] = None
+    budget: Optional[str] = None
+    institution_type_pref: Optional[str] = None
+    study_abroad: Optional[str] = None
+    profile_completion: Optional[int] = 10
+
+@app.post("/profile/upsert")
+async def upsert_profile(request: ProfileUpsertRequest, db: Session = Depends(get_db)):
+    """Create or update a student profile in the database."""
+    user = db.query(User).filter(User.mobile == request.user_mobile).first()
+    user_id = user.id if user else None
+    
+    existing = db.query(UserProfile).filter(UserProfile.profile_id == request.profile_id).first()
+    
+    profile_data = {
+        "user_id": user_id,
+        "name": request.name,
+        "relation": request.relation,
+        "standard": request.standard,
+        "board": request.board,
+        "district": request.district,
+        "school": request.school,
+        "community": request.community,
+        "dob": request.dob,
+        "maths": request.maths,
+        "physics": request.physics,
+        "chemistry": request.chemistry,
+        "computed_cutoff": request.computed_cutoff,
+        "interests": json.dumps(request.interests or []),
+        "career_goals": json.dumps(request.career_goals or []),
+        "strong_subjects": json.dumps(request.strong_subjects or []),
+        "weak_subjects": json.dumps(request.weak_subjects or []),
+        "preferred_location": request.preferred_location,
+        "hostel_required": request.hostel_required,
+        "budget": request.budget,
+        "institution_type_pref": request.institution_type_pref,
+        "study_abroad": request.study_abroad,
+        "profile_completion": request.profile_completion,
+        "updated_at": datetime.utcnow(),
+    }
+    
+    if existing:
+        for k, v in profile_data.items():
+            setattr(existing, k, v)
+    else:
+        profile_data["profile_id"] = request.profile_id
+        profile_data["created_at"] = datetime.utcnow()
+        new_profile = UserProfile(**profile_data)
+        db.add(new_profile)
+    
+    db.commit()
+    return {"success": True, "profile_id": request.profile_id}
+
+@app.get("/profile/{profile_id}")
+async def get_profile(profile_id: str, db: Session = Depends(get_db)):
+    profile = db.query(UserProfile).filter(UserProfile.profile_id == profile_id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {
+        "profile_id": profile.profile_id,
+        "name": profile.name,
+        "relation": profile.relation,
+        "standard": profile.standard,
+        "board": profile.board,
+        "district": profile.district,
+        "community": profile.community,
+        "dob": profile.dob,
+        "maths": profile.maths,
+        "physics": profile.physics,
+        "chemistry": profile.chemistry,
+        "computed_cutoff": profile.computed_cutoff,
+        "interests": json.loads(profile.interests or "[]"),
+        "career_goals": json.loads(profile.career_goals or "[]"),
+        "strong_subjects": json.loads(profile.strong_subjects or "[]"),
+        "weak_subjects": json.loads(profile.weak_subjects or "[]"),
+        "preferred_location": profile.preferred_location,
+        "hostel_required": profile.hostel_required,
+        "budget": profile.budget,
+        "institution_type_pref": profile.institution_type_pref,
+        "study_abroad": profile.study_abroad,
+        "profile_completion": profile.profile_completion,
+    }
+
+@app.get("/profiles/user/{mobile}")
+async def get_user_profiles(mobile: str, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.mobile == mobile).first()
+    if not user:
+        return []
+    profiles = db.query(UserProfile).filter(UserProfile.user_id == user.id).all()
+    return [
+        {
+            "profile_id": p.profile_id,
+            "name": p.name,
+            "relation": p.relation,
+            "standard": p.standard,
+            "district": p.district,
+            "community": p.community,
+            "profile_completion": p.profile_completion,
+            "interests": json.loads(p.interests or "[]"),
+        }
+        for p in profiles
+    ]
+
+# ─── CHAT HISTORY ENDPOINTS ───────────────────────────────────────────────────
+
+class ChatMessageRequest(BaseModel):
+    profile_id: str
+    role: str   # 'user' | 'ai'
+    message: str
+
+@app.post("/chat-history/add")
+async def add_chat_message(request: ChatMessageRequest, db: Session = Depends(get_db)):
+    msg = ChatHistory(
+        profile_id=request.profile_id,
+        role=request.role,
+        message=request.message,
+        created_at=datetime.utcnow()
+    )
+    db.add(msg)
+    db.commit()
+    return {"success": True}
+
+@app.get("/chat-history/{profile_id}")
+async def get_chat_history(profile_id: str, limit: int = 50, db: Session = Depends(get_db)):
+    msgs = db.query(ChatHistory).filter(
+        ChatHistory.profile_id == profile_id
+    ).order_by(ChatHistory.created_at.asc()).limit(limit).all()
+    return [
+        {"role": m.role, "message": m.message, "created_at": m.created_at.isoformat()}
+        for m in msgs
+    ]
+
+@app.delete("/chat-history/{profile_id}")
+async def clear_chat_history(profile_id: str, db: Session = Depends(get_db)):
+    db.query(ChatHistory).filter(ChatHistory.profile_id == profile_id).delete()
+    db.commit()
+    return {"success": True}
+
+# ─── SAVED COLLEGES ENDPOINTS ─────────────────────────────────────────────────
+
+class SaveCollegeRequest(BaseModel):
+    profile_id: str
+    college_code: str
+    college_name: str
+    branch_name: Optional[str] = None
+    district: Optional[str] = None
+    notes: Optional[str] = None
+
+@app.post("/saved-colleges/add")
+async def save_college(request: SaveCollegeRequest, db: Session = Depends(get_db)):
+    # Avoid duplicates
+    existing = db.query(SavedCollege).filter(
+        SavedCollege.profile_id == request.profile_id,
+        SavedCollege.college_code == request.college_code,
+        SavedCollege.branch_name == (request.branch_name or "")
+    ).first()
+    if existing:
+        return {"success": True, "message": "Already saved"}
+    saved = SavedCollege(
+        profile_id=request.profile_id,
+        college_code=request.college_code,
+        college_name=request.college_name,
+        branch_name=request.branch_name or "",
+        district=request.district or "",
+        notes=request.notes or "",
+        saved_at=datetime.utcnow()
+    )
+    db.add(saved)
+    db.commit()
+    return {"success": True}
+
+@app.get("/saved-colleges/{profile_id}")
+async def get_saved_colleges(profile_id: str, db: Session = Depends(get_db)):
+    colleges = db.query(SavedCollege).filter(SavedCollege.profile_id == profile_id).all()
+    return [
+        {
+            "college_code": c.college_code,
+            "college_name": c.college_name,
+            "branch_name": c.branch_name,
+            "district": c.district,
+            "notes": c.notes,
+            "saved_at": c.saved_at.isoformat()
+        }
+        for c in colleges
+    ]
+
+@app.delete("/saved-colleges/{profile_id}/{college_code}")
+async def remove_saved_college(profile_id: str, college_code: str, db: Session = Depends(get_db)):
+    db.query(SavedCollege).filter(
+        SavedCollege.profile_id == profile_id,
+        SavedCollege.college_code == college_code
+    ).delete()
+    db.commit()
+    return {"success": True}
+
+# ─── PERSISTED CHOICE LIST ────────────────────────────────────────────────────
+
+class AddChoiceRequest(BaseModel):
+    profile_id: str
+    college_code: str
+    college_name: str
+    branch_name: str
+    district: Optional[str] = None
+    cutoff: Optional[str] = None
+    tier: Optional[str] = None
+    notes: Optional[str] = None
+
+@app.post("/choice/persist/add")
+async def persist_choice(request: AddChoiceRequest, db: Session = Depends(get_db)):
+    existing = db.query(CollegeChoice).filter(
+        CollegeChoice.profile_id == request.profile_id,
+        CollegeChoice.college_code == request.college_code,
+        CollegeChoice.branch_name == request.branch_name
+    ).first()
+    if existing:
+        return {"success": True, "message": "Already in list"}
+    choice = CollegeChoice(
+        profile_id=request.profile_id,
+        college_code=request.college_code,
+        college_name=request.college_name,
+        branch_name=request.branch_name,
+        district=request.district or "",
+        cutoff=request.cutoff or "",
+        tier=request.tier or "",
+        notes=request.notes or "",
+        priority=0,
+        saved_at=datetime.utcnow()
+    )
+    db.add(choice)
+    db.commit()
+    return {"success": True}
+
+@app.get("/choice/persist/{profile_id}")
+async def get_persisted_choices(profile_id: str, db: Session = Depends(get_db)):
+    choices = db.query(CollegeChoice).filter(
+        CollegeChoice.profile_id == profile_id
+    ).order_by(CollegeChoice.priority, CollegeChoice.saved_at).all()
+    return [
+        {
+            "college_code": c.college_code,
+            "college_name": c.college_name,
+            "branch_name": c.branch_name,
+            "district": c.district,
+            "cutoff": c.cutoff,
+            "tier": c.tier,
+            "notes": c.notes,
+            "priority": c.priority,
+        }
+        for c in choices
+    ]
+
+@app.delete("/choice/persist/{profile_id}/{college_code}")
+async def remove_persisted_choice(profile_id: str, college_code: str, db: Session = Depends(get_db)):
+    db.query(CollegeChoice).filter(
+        CollegeChoice.profile_id == profile_id,
+        CollegeChoice.college_code == college_code
+    ).delete()
+    db.commit()
+    return {"success": True}
+
+# Serve Frontend
+frontend_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "frontend", "dist")
+if os.path.exists(frontend_path):
+    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")

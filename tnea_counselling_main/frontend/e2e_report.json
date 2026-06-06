@@ -1,0 +1,17 @@
+[
+  {
+    "action": "Open landing page",
+    "result": "Landing page loaded successfully.",
+    "api": []
+  },
+  {
+    "action": "Navigate through auth",
+    "result": "Auth form submitted, redirected to Onboarding.",
+    "api": []
+  },
+  {
+    "action": "Select community",
+    "result": "Selected BC community.",
+    "api": []
+  }
+]
